@@ -1,6 +1,8 @@
 import {NextRequest, NextResponse} from "next/server";
 import zod, {object, ZodTypeAny} from "zod";
 import {type} from "os";
+import {openai} from "@/app/lib/openai";
+import {CONTENT, EXAMPLE_ANSWER, EXAMPLE_PROMPT} from "@/app/api/json/example";
 
 const determineSchemaType = (schema: any) => {
     if (!schema.hasOwnProperty("type")) {
@@ -35,6 +37,19 @@ const jsonSchemaToZod = (schema: any): ZodTypeAny => {
     }
 }
 
+type PromiseExecutor<T> = (
+    resolve: (value: T) => void,
+    reject: (reason?: any) => void
+) => void;
+
+class RetryablePromise<T> extends Promise<T> {
+    static async retry<T>(retries: number, executor: PromiseExecutor<T>): Promise<T> {
+        return new RetryablePromise(executor).catch(err => {
+            return retries > 0 ? RetryablePromise.retry(retries - 1, executor) : RetryablePromise.reject(err);
+        })
+    }
+}
+
 export const POST = async (req: NextRequest) => {
 
     const body = await req.json();
@@ -44,33 +59,48 @@ export const POST = async (req: NextRequest) => {
         format: zod.object({}).passthrough()
     });
 
-    const { data, format } = genericSchema.parse(body);
+    const {data, format} = genericSchema.parse(body);
 
     const dynamicSchema = jsonSchemaToZod(format);
 
-    type PromiseExecutor<T> = (
-        resolve: (value: T) => void,
-        reject: (reason?: any) => void
-    ) => void;
+    const content = CONTENT(data, format);
 
-    class RetryablePromise<T> extends Promise<T> {
-        static async retry<T>(retries: number, executor: PromiseExecutor<T>): Promise<T> {
-            return new RetryablePromise(executor).catch(err => {
-                return retries > 0 ? RetryablePromise.retry(retries - 1, executor) : RetryablePromise.reject(err);
-            })
-        }
-    }
-
-    const validationResult = RetryablePromise.retry<object>(3, (resolve, reject) => {
+    const validationResult = await RetryablePromise.retry<string>(1, async (resolve, reject) => {
         try {
-            const res = "";
-            const validationResult = dynamicSchema.parse(JSON.parse(res));
+            const res = await openai.chat.completions.create({
+                model: "gpt-3.5-turbo",
+                messages: [
+                    {
+                        role: "assistant",
+                        content: "You are an AI that converts data into the attached JSON format. You respond nothing " +
+                            "but valid JSON based on the input data. Your output should be DIRECTLY be valid JSON, " +
+                            "nothing added before and after. You will begin with the opening curly brace and end with " +
+                            "the closing brace. Only if absolutely cannot determine a field, use the value null.",
+                    },
+                    {
+                        role: "user",
+                        content: EXAMPLE_PROMPT
+                    },
+                    {
+                        role: "user",
+                        content: EXAMPLE_ANSWER
+                    },
+                    {
+                        role: "user",
+                        content
+                    }
+                ]
+            });
+
+            const text = res.choices[0].message.content;
+
+            const validationResult = dynamicSchema.parse(JSON.parse(text || ""));
             return resolve(validationResult);
         } catch (e) {
             reject(e);
         }
     });
 
-    return NextResponse.json(validationResult, { status: 200 });
+    return NextResponse.json(validationResult, {status: 200});
 }
 
